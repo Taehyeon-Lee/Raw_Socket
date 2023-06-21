@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+
+import socket
+import sys
+import struct
+import random
+import time
+
+import tcp_layer
+import ip_layer
+import packet_buffer
+import buffer_item
+
+
+'''
+Finds the client IP address and port
+
+PARAMETERS:
+	- None
+
+RETURNS:
+	- The client IP address and port
+'''
+def get_client_ip_and_port():
+	# create temp socket
+	temp = socket.socket()
+	temp.connect(("www.google.com", 80))
+
+	# init IPs and ports
+	client_ip, client_port = temp.getsockname()
+
+	# close temp socket and return
+	temp.close()
+	return client_ip, client_port
+
+
+'''
+Creates a SOCK_RAW/IPPROTO_TCP socket for sending packets
+
+PARAMETERS:
+	- client_ip: the client IP address
+	- client_port: the client port
+	- server_ip: the server IP address
+	- server_port: the server port
+
+RETURNS:
+	- The created SOCK_RAW/IPPROTO_TCP socket
+'''
+def create_IPPROTO_TCP_send(client_ip, client_port, server_ip, server_port):
+	try:
+		# create raw socket
+		s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+
+		# set the source IP and port
+		s.bind((client_ip, client_port))
+
+		# Set the IP header to be included in the raw packet
+		s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+
+		# connect
+		s.connect((server_ip, server_port))
+
+		return s
+	except socket.error as msg:
+		print('Socket (send) could not be created. Error Code : ' + str(msg[0]) + ' Message ' + msg[1])
+		sys.exit()
+
+
+'''
+Creates a SOCK_RAW/IPPROTO_RAW socket for receiving packets
+
+PARAMETERS:
+	- client_ip: the client IP address
+
+RETURNS:
+	- The created SOCK_RAW/IPPROTO_RAW socket
+'''
+def create_IPPROTO_RAW_receive(client_ip):
+	try:
+		# create raw socket
+		s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+
+		# Indicate that we'll be constructing our own IP header
+		s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+
+		# bind receive socket to local address and random port
+		s.bind((client_ip, 0))
+
+		return s
+	except socket.error as msg:
+		print(msg)
+		print('Socket (receive) could not be created. Error Code : ' + str(msg[0]) + ' Message ' + msg[1])
+		sys.exit()
+
+
+"""
+    Calculates and sets checksum values for ip packets
+
+    PARAMETERS:
+        - data: the specified piece of data to calculate a checksum for
+
+    RETURNS:
+        - checksum value
+    """
+def calculate_checksum( msg):
+	Csum = 0
+
+	for i in range(0, len(msg), 2):
+		if (i + 1) < len(msg):
+			a = msg[i]
+			b = msg[i + 1]
+			Csum = Csum + (a + (b << 8))
+		elif (i + 1) == len(msg):
+			Csum += msg[i]
+		else:
+			raise "Something Wrong here"
+
+	# One's Complement
+	Csum = Csum + (Csum >> 16)
+	Csum = ~Csum & 0xffff
+
+	return Csum
+
+
+"""
+Constructs a packet including the payload, TCP layer and IP layer
+
+PARAMETERS:
+	- tcp: the tcp object with the flag values ALREADY set
+
+RETURNS:
+	- The constructed packet
+"""
+def construct_packet(tcp):
+	# create temp packet to set checksum
+	tcp.create_temp_header()
+	tcp.create_pesudo()
+	packet_to_calculate = tcp.combine_packets_to_calculate_checksum()
+	tcp.calculate_checksum(packet_to_calculate)
+
+	# finalize tcp packet
+	tcp.finalize_packet()
+
+	# create IP object
+	ip = ip_layer.IP_layer(client_ip, server_ip)
+
+	# set total length of IP with TCP layer
+	ip.set_ip_total_len(tcp.final_header)
+
+	# assemble and calculate checksum
+	ip.assemble_ip_packet()
+	ip.calculate_checksum(ip.header)
+
+	# assemble with the calculated checksum
+	ip.assemble_ip_packet()
+
+	# combine all layers and return
+	packet = ip.header + tcp.final_header
+	return packet
+
+
+"""
+Sends a SYN packet to the server for step 1 of the 3-way handshake protocol
+
+PARAMETERS:
+	- sock: the socket created for sending from client to server
+	- client_ip: the client IP address
+	- client_port: the client port
+	- server_ip: the server IP address
+	- server_port: the server port
+	- payload: the payload for the packet being sent
+	- attempts: the number of attempts it takes to send the SYN (initially set at 1)
+
+RETURNS:
+	- True if SYN packet was successfully sent, False otherwise
+	- The number of attempts it took so successfully send the SYN
+"""
+def send_SYN_packet(sock, client_ip, client_port, server_ip, server_port, payload, attempts):
+	if (attempts > 10):
+		# Too many attempts to find an open port - "timeout"
+		return False
+
+	try:
+		# create tcp SYN object
+		tcp_SYN = tcp_layer.TCP_layer(client_ip, client_port, server_ip, server_port, payload)
+
+		# set flags
+		tcp_SYN.syn_flag = 1
+		tcp_SYN.set_all_flags()
+
+		# construct packet and send
+		packet = construct_packet(tcp_SYN)
+		sock.sendto(packet, (server_ip, server_port))
+
+		return True, attempts
+
+	except socket.error:
+		print(f"Port {client_port} is in use.")
+		client_port = random.randint(1024, 65535)
+		print(f"Trying again with port {client_port}...")
+		attempts += 1
+		send_SYN_packet(sock, client_ip, client_port, server_ip, server_port, payload, attempts)
+
+
+"""
+Validates a received packets IP checksum
+
+PARAMETERS:
+	- data: the IP header for which to validate
+
+RETURNS:
+	- True if IP checksum is valid, false otherwise
+"""
+def checksum_validator(data):
+	# If the length of the data is odd, add a padding byte with value zero
+	if len(data) % 2 == 1:
+		data += b'\x00'
+
+	# Calculate the sum of every 16-bit word in the data
+	s = sum(struct.unpack('!%dH' % (len(data) // 2), data))
+
+	# Fold the sum into a 16-bit value by adding the carry to the low 16 bits
+	s = (s & 0xffff) + (s >> 16)
+
+	# Take the one's complement of the result and return it as a 16-bit integer
+	status = ~s & 0xffff
+
+	if status == 0:
+		return True
+	else:
+		return False
+
+
+"""
+Sends an ACK packet to the server
+
+PARAMETERS:
+	- sock: the socket created for sending from client to server
+	- client_ip: the client IP address
+	- client_port: the client port
+	- server_ip: the server IP address
+	- server_port: the server port
+	- payload: the server port
+	- attempts: the number of attempts it takes to send the SYN (initially set at 1)
+	- ack_num: the ack number of the last packet received
+	- seq_num: the sequence number of the last packet received
+	- psh_val: the value of the psh flag
+	- fin_val: the value of the fin flag
+	- last_payload: the last payload received from the server, or "" if none provided
+
+RETURNS:
+	- True if ACK packet was successfully sent, False otherwise
+	- The number of attempts it took so successfully send the ACK
+	- The ack number of the packet sent
+	- The sequence number of the packet sent
+"""
+def send_ACK_packet(sock, client_ip, client_port, server_ip, server_port, payload, attempts, ack_num, seq_num, psh_val,
+					fin_val, last_payload=""):
+	if (attempts > 10):
+		# Too many attempts to find an open port - "timeout"
+		return False
+
+	try:
+		# create tcp ACK object
+		tcp_ACK = tcp_layer.TCP_layer(client_ip, client_port, server_ip, server_port, payload)
+
+		# update sequence and ack numbers
+		adder = len(last_payload)
+		if adder == 0:
+			adder = 1
+
+		if psh_val == 1:
+			tcp_ACK.ack_num = ack_num
+			tcp_ACK.seq_num = seq_num
+		else:
+			tcp_ACK.ack_num = seq_num + adder
+			tcp_ACK.seq_num = ack_num
+
+		# set flags
+		tcp_ACK.fin_flag = fin_val
+		tcp_ACK.ack_flag = 1
+		tcp_ACK.psh_flag = psh_val
+		tcp_ACK.set_all_flags()
+
+		# construct packet and send
+		packet = construct_packet(tcp_ACK)
+		sock.sendto(packet, (server_ip, server_port))
+
+		return True, attempts, tcp_ACK.ack_num, tcp_ACK.seq_num
+
+	except socket.error:
+		print(f"Port {client_port} is in use.")
+		client_port = random.randint(1024, 65535)
+		print(f"Trying again with port {client_port}...")
+		attempts += 1
+		send_SYN_packet(sock, client_ip, client_port, server_ip, server_port, payload, attempts)
+
+
+"""
+Establishes TCP connection with 3-way handshake protocol
+
+PARAMETERS:
+	- send_sock: the socket created for sending from client to server
+	- recv_sock: the socket created for receiving from server to client
+	- client_ip: the client IP address
+	- client_port: the client port
+	- server_ip: the server IP address
+	- server_port: the server port
+	- Buffer: the packet buffer object
+
+RETURNS:
+	- ack_num: the ack number of the last packet sent
+	- seq_num: the sequence number of the last packet sent
+"""
+def three_way_handshake(send_sock, recv_sock, client_ip, client_port, server_ip, server_port, Buffer):
+	# C-->S SYN
+	status, attempts = send_SYN_packet(send_sock, client_ip, client_port, server_ip, server_port, "", 1)
+
+	# throw error if unsuccessful
+	if not status:
+		exit(f"Attempt to send SYN packet (3wH step 1) timed out after {attempts} attempts.")
+
+	status, isn = receive_syn_ack(recv_sock, server_ip, server_port, Buffer)
+
+	# throw error if unsuccessful
+	if not status:
+		exit(f"Attempt to receive SYN/ACK packet (3wH step 2) failed.")
+	else:
+		item = Buffer.buffer[isn]
+		ack_num = item.ack_num
+		seq_num = item.seq_num
+		payload = item.payload
+
+	# C-->S ACK
+	status, attempts, ack_num, seq_num = send_ACK_packet(send_sock, client_ip, client_port, server_ip, server_port,
+														 payload, 1, ack_num, seq_num, 0, 0, "")
+
+	# throw error if unsuccessful
+	if not status:
+		exit(f"Attempt to send ACK packet (3wH step 3) timed out after {attempts} attempts.")
+
+	# remove SYN/ACK from buffer and set it as last shipped item
+	Buffer.remove(ack_num - 1)
+
+	return ack_num, seq_num
+
+
+"""
+Sends an HTTP GET request to the server, requesting a file
+
+PARAMETERS:
+	- file_name: the name of the file being requested 
+	- send_sock: the socket created for sending from client to server
+	- client_ip: the client IP address
+	- client_port: the client port
+	- server_ip: the server IP address
+	- server_port: the server port
+	- last_ack: the ack number of the last packet sent
+	- last_seq: the sequence number of the last packet sent
+
+RETURNS:
+	- status; true if request was succesfully sent, false otherwise
+	- len(payload) - the length of the payload sent
+"""
+def http_GET_request(extension, file_name, host, send_sock, client_ip, client_port, server_ip, server_port, last_ack, last_seq):
+	# if specific file name is not should go to the url without filename
+	if file_name == "index.html":
+		file_name = ""
+
+	# construct payload string
+	payload = "GET " + extension + "/" + file_name + " HTTP/1.1\r\nHost: " + host + "\r\n\r\n"
+
+	# send ACK packet with PSH flag set
+	status, attempts, ack_num, seq_num = send_ACK_packet(send_sock, client_ip, client_port, server_ip, server_port,
+														 payload, 1, last_ack, last_seq, 1, 0, "")
+
+	return status, len(payload)
+
+
+"""
+Receives a SYN ACK packet from the server during the three way handshake
+
+PARAMETERS:
+	- recv_sock: the socket created for receiving from server to client
+	- server_ip: the server IP address
+	- server_port: the server port
+	- Buffer: the packet buffer object
+
+RETURNS:
+	- True if successfully received the syn-ack
+	- Seq number of the syn ack
+"""
+def receive_syn_ack(recv_sock, server_ip, server_port, Buffer):
+	while True:
+		# Receive packet data
+		packet_data, _ = recv_sock.recvfrom(100000)
+		s_addr = _[0]
+
+		# continue only if server IP matches
+		if s_addr == server_ip:
+			# Unpack the IP header
+			ip_header = packet_data[0:20]
+			iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
+			ihl = iph[0] & 0x0F
+			length = iph[2]
+			tcp_header = packet_data[ihl * 4: length]
+			# header = packet_data[:ihl*4] need it for validate checksum later
+
+			# Unpack the TCP header
+			tcph = struct.unpack('!HHLLBBH', tcp_header[0:16])
+			source_port = tcph[0]
+			offset = tcph[4]
+			offset2 = (offset >> 4) * 4
+			data = tcp_header[offset2:]
+
+			if source_port == server_port:
+				# grab necessary info
+				seq_num = tcph[2]
+				ack_num = tcph[3]
+				doff_reserved = tcph[4]
+				tcph_length = doff_reserved >> 4
+				syn_flag = (tcph[5] & 0x02) != 0
+				ack_flag = (tcph[5] & 0x10) != 0
+				psh_flag = (tcph[5] & 0b00001000) != 0
+				fin_flag = (tcph[5] & 0b00000001) != 0
+
+				# IPs and PORTs MATCH
+				# validate checksum
+				val_status = checksum_validator(ip_header)
+				if val_status:
+					payload = b""
+					buf_item = buffer_item.Buffer_Item(ack_num, seq_num, payload, packet_data, s_addr)
+					Buffer.buffer[seq_num] = buf_item
+					Buffer.last_received_item = buf_item
+					return True, seq_num
+
+				else:
+					print("CORRUPTED CHECKSUM")
+
+		# received a packet not intended for us - continue
+		continue
+
+
+"""
+Parses command line for the url of the file to download
+
+PARAMETERS:
+	- None
+
+RETURNS:
+	- The url of the file to download
+"""
+def parse_CL_args():
+	if len(sys.argv) != 2:
+		exit("[-] Invalid arguments. Run the program with './rawhttpget <URL of file to download>'")
+	return sys.argv[1]
+
+
+"""
+Parses url for the host name and the file to download
+
+PARAMETERS:
+	- url: the url provided by the user
+
+RETURNS:
+	- The name of the file to download
+	- The IP address of the host
+	- The extension path for where the file is located in the server
+	- The name of the host
+"""
+def parse_url(url):
+	try:
+		file = url.rsplit('/', 1)[-1]
+		host = url[url.index('http://') + 7: url.index('.com/') + 4]
+		extension = url[url.index('.com/') + 4: url.index(file) - 1]
+
+		if file == "":
+			file = "index.html"
+
+		# get server IP from url
+		ip = socket.gethostbyname(host)
+
+		return file, ip, extension, host
+
+	except Exception:
+		exit("Error in retrieving the filename and IP. Check the url provided (MUST be http) and try again...")
+
+"""
+Executes the flow of data from the server with acks from the client until fin ack is received from the server,
+indicating that the teardown process will occur
+
+PARAMETERS:
+	- recv_sock: the socket created for receiving from server to client
+	- server_ip: the server IP address
+	- server_port: the port that the server is listening on
+	- Buffer: the packet buffer object
+	- file_name: the name of the file we are writing to
+
+RETURNS:
+	- None
+"""
+def data_exchange(recv_sock, server_ip, server_port, Buffer, file_name):
+	try:
+		cwnd = 1
+		fin_breaker = False
+		while not fin_breaker:
+			start_time = time.time()
+			packet_data, _ = recv_sock.recvfrom(100000)
+			s_addr = _[0]
+
+			# discard non-relevant IP addresses
+			if s_addr != server_ip:
+				continue
+
+			# Unpack the IP header
+			ip_header = packet_data[0:20]
+			iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
+			ihl = iph[0] & 0x0F
+			length = iph[2]
+			tcp_header = packet_data[ihl * 4: length]
+			# header = packet_data[:ihl*4] need it for validate checksum later
+
+			# Validate IP Header
+			val_status = checksum_validator(ip_header)
+			if not val_status:
+				# corrupted packet
+				# re-transmit last ack
+				status, attempts, ack_num, seq_num = send_ACK_packet(send_sock, client_ip, client_port,
+																	 server_ip,
+																	 server_port,
+																	 "", 1, Buffer.last_shipped_item.ack_num,
+																	 Buffer.last_shipped_item.seq_num, 0, 0,
+																	 Buffer.last_shipped_item.payload)
+				# reset cwnd and break
+				cwnd = 1
+				break
+
+			# Unpack the TCP header
+			tcph = struct.unpack('!HHLLBBH', tcp_header[0:16])
+			source_port = tcph[0]
+			offset = tcph[4]
+			offset2 = (offset >> 4) * 4
+			payload = tcp_header[offset2:]
+
+			seq_num = tcph[2]
+			ack_num = tcph[3]
+			doff_reserved = tcph[4]
+			tcph_length = doff_reserved >> 4
+			syn_flag = (tcph[5] & 0x02) != 0
+			ack_flag = (tcph[5] & 0x10) != 0
+			psh_flag = (tcph[5] & 0b00001000) != 0
+			fin_flag = (tcph[5] & 0b00000001) != 0
+
+			if source_port != server_port:
+				# corrupted packet
+				# re-transmit last ack
+				status, attempts, ack_num, seq_num = send_ACK_packet(send_sock, client_ip, client_port,
+																	 server_ip,
+																	 server_port,
+																	 "", 1, Buffer.last_shipped_item.ack_num,
+																	 Buffer.last_shipped_item.seq_num, 0, 0,
+																	 Buffer.last_shipped_item.payload)
+				# reset cwnd and break
+				cwnd = 1
+				break
+
+			# validate TCP checksum
+			try:
+				tcp_length = len(payload) + offset2
+				pseudo_header = struct.pack('!4s4sBBH',
+											socket.inet_aton(server_ip),
+											socket.inet_aton(client_ip),
+											0, socket.IPPROTO_TCP, tcp_length)
+				to_validate = pseudo_header + tcp_header
+
+				if calculate_checksum(to_validate) == 0:
+					pass
+
+			except Exception:
+				print("Validating TCP Checksum failed")
+
+
+			if len(payload) == 0 and not fin_flag:
+				# ignore empty packets
+				continue
+
+			if seq_num < Buffer.next_expected_seq:
+				# repeat packet - ignore
+				continue
+
+			# calculate time for 60 seconds timeout
+			time_out_chk = time.time() - start_time
+			if time_out_chk >= 60:
+				status, attempts, ack_num, seq_num = send_ACK_packet(send_sock, client_ip, client_port,
+																	 server_ip,
+																	 server_port,
+																	 "", 1, Buffer.last_shipped_item.ack_num,
+																	 Buffer.last_shipped_item.seq_num, 0, 0,
+																	 Buffer.last_shipped_item.payload)
+				# reset cwnd and break
+				cwnd = 1
+				continue
+
+			# Start processing data
+			buf_item = buffer_item.Buffer_Item(ack_num, seq_num, payload, packet_data, s_addr)
+			Buffer.buffer[seq_num] = buf_item
+			Buffer.last_received_item = buf_item
+
+			# look in buffer and see if next expected packet to ack is there
+			next_seq = Buffer.next_expected_seq
+			if next_seq in Buffer.buffer.keys():
+				if fin_flag and ack_flag:
+					# initiate teardown
+					fin_breaker = True
+					# fin ack the fin ack
+					status, attempts, ack_num, seq_num = send_ACK_packet(send_sock, client_ip, client_port,
+																		 server_ip,
+																		 server_port,
+																		 "", 1, Buffer.next_expected_ack,
+																		 Buffer.next_expected_seq, 0, 1,
+																		 Buffer.buffer[
+																			 Buffer.next_expected_seq].payload)
+				else:
+					# ack the data packet
+					status, attempts, ack_num, seq_num = send_ACK_packet(send_sock, client_ip, client_port,
+																		 server_ip,
+																		 server_port,
+																		 "", 1, Buffer.next_expected_ack,
+																		 Buffer.next_expected_seq, 0, 0,
+																		 Buffer.buffer[
+																			 Buffer.next_expected_seq].payload)
+
+				# write out the payload to the file
+				if not fin_breaker:
+					with open(file_name, 'a+b') as f:
+						try:
+							i = Buffer.buffer[Buffer.next_expected_seq].payload.index(b'\r\n\r\n') + 4
+						except:
+							i = 0
+
+						# Handling chunked encoding
+						if b"chunked" in Buffer.buffer[Buffer.next_expected_seq].payload[0:i+1]:
+							i = Buffer.buffer[Buffer.next_expected_seq].payload.index(b'\r\n\r\n')
+							payload_to_write = chunked_encoding(Buffer.buffer[Buffer.next_expected_seq].payload[i:])
+							f.write(payload_to_write)
+
+						else:
+							f.write(Buffer.buffer[Buffer.next_expected_seq].payload[i:])
+
+					# remove packet from buffer
+					Buffer.remove(Buffer.next_expected_seq)
+
+					# update next expected seq num
+					Buffer.next_expected_seq = Buffer.last_shipped_item.seq_num + Buffer.last_shipped_item.length
+
+					# successful ack - increment cwnd
+					cwnd += 1
+
+			else:
+				# re-transmit last ack and continue searching
+				status, attempts, ack_num, seq_num = send_ACK_packet(send_sock, client_ip, client_port,
+																	 server_ip,
+																	 server_port,
+																	 "", 1, Buffer.last_shipped_item.ack_num,
+																	 Buffer.last_shipped_item.seq_num, 0, 0,
+																	 Buffer.last_shipped_item.payload)
+				cwnd = 1
+				break
+
+			# update congestion window
+			if cwnd > 1000:
+				cwnd = 1000
+
+	except Exception:
+		exit(f"[-] An error occurred while attempting to download {file_name}. Check your connection and try again...")
+
+"""
+Handles chunk encoded data and parse the body of data
+
+PARAMETERS:
+	- raw_data: The chunk encoded body part of the data
+
+RETURNS:
+	- parsed data
+"""
+def chunked_encoding(raw_data):
+	data = raw_data.split(b"\r\n")
+	write_data = b''
+	for i in range(len(data)):
+		if i % 2 == 1:
+			write_data += data[i]
+		elif data[i] == b"0":
+			return write_data
+
+	return write_data
+
+
+
+##########################################################################################
+
+
+# main execution flow
+if __name__ == "__main__":
+	# init client IPs and ports
+	try:
+		client_ip, client_port = get_client_ip_and_port()
+	except Exception:
+		exit("[-] Client IP and port could not be found. Please try again...")
+
+	# extract url, filename, server address, file location and hostname
+	url = parse_CL_args()
+	file_name, server_ip, extension, host = parse_url(url)
+	server_port = 80
+
+	# create raw sockets for sending and receiving
+	send_sock = create_IPPROTO_TCP_send(client_ip, client_port, server_ip, server_port)
+	recv_sock = create_IPPROTO_RAW_receive(client_ip)
+
+	print(f"[+] Connected to host {host} at IP: {server_ip}")
+
+	# create packet buffer
+	Buffer = packet_buffer.Packet_Buffer()
+
+	# 3 way handshake
+		# C-->S SYN
+		# S-->C SYN ACK
+		# C-->S ACK
+	last_ack, last_seq = three_way_handshake(send_sock, recv_sock, client_ip, client_port, server_ip,
+											 server_port, Buffer)
+
+	print(f"[+] 3-way handshake success")
+
+	# C-->S GET HTTP request
+	status, get_len = http_GET_request(extension, file_name, host, send_sock, client_ip, client_port, server_ip, server_port, last_ack, last_seq)
+
+	if not status:
+		exit(f"[-] An error occurred when attempting to send the GET request to host {host}. Please check"
+			 f"your connection and try again...")
+
+	print(f"[+] GET request success")
+
+	# update Buffer with next expected packet attributes
+	Buffer.next_expected_seq = Buffer.last_shipped_item.seq_num + 1
+	Buffer.next_expected_ack = Buffer.last_shipped_item.ack_num + get_len
+
+	# begin loop of receiving and acking data
+	# while data
+		# S-->C data transfer
+		# C-->S ack
+
+	print("[+] Beginning data exchange...")
+	data_exchange(recv_sock, server_ip, server_port, Buffer, file_name)
+	# then
+	# Termination
+		# S-->C FIN ACK
+		# C-->S FIN ACK
+		# S-->C ACK
+
+	print(f"[+] {file_name} download success!")
+
+	# close sockets
+	send_sock.close()
+	recv_sock.close()
+
+	print("[+] Connection closed. Goodbye")
+

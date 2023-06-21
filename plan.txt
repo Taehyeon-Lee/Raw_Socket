@@ -1,0 +1,42 @@
+Choffnes URL: http://david.choffnes.com/
+Wireshark fileter: ip.dst_host == 204.44.192.60 || ip.src_host == 204.44.192.60
+                   (ip.dst_host == 204.44.192.60 || ip.src_host == 204.44.192.60) || (ip.dst_host == 10.0.2.15 && ip.src_host == 204.44.192.60)
+IP table modification command: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
+
+1. HTTP over standard TCP - done (?)
+
+2. TED
+    IP layer with handcrafted UDP layers + testing
+    a. implement flags, fragment offset, checksum (calc + verify), etc.
+        (essentially learn all header items and figure out how to set them)
+    Specs:
+    validate incoming checksums
+    set version, header len, total len, protocol ID, checksum for outgoings
+    set src and dest IPs
+    defensive checks - IP, checksum, protocol ID
+
+3. MITCH
+    TCP layer with kernel's IP layer + testing
+    a. learn execution flow (handshake, flow of data(seq number, ), teardown)
+    Specs:
+    Verify checksums of incoming
+    Calc checksums of outgoing
+    select a valid port to send on
+    3 way handshake
+    connection teardown
+    seq number handling
+    ack number handling
+    advertised window management
+    timeout functionality - 1 min = lost and retransmit
+    order all packets with same ID
+    identify and discard duplicates
+    congestion window management (start = 1, max = 1000, reset to 1 on drop/timeout)
+    defensive checks - checksums, in order seq nums
+    3 min pause = close and print error message
+
+2+3: receive socket = SOCK_RAW/IPPROTO_TCP
+        ALSO: filter packets to ensure they belong to this program
+     send socket = SOCK_RAW/IPPROTO_RAW
+
+
+4. Combine 2 & 3 + testing
